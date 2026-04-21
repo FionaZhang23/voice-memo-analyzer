@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voice Memo Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <main class="container">
+    <h1>Voice Memo Analyzer</h1>
+    <p class="subtitle">
+      Upload a WAV/MP3 file or record a short memo, then run the full Azure pipeline:
+      Speech-to-Text → Language Analysis → Text-to-Speech.
+    </p>
+
+    <section class="card">
+      <h2>1. Audio Input</h2>
+
+      <div class="input-block">
+        <label for="audioFile"><strong>Upload an audio file</strong></label>
+        <input type="file" id="audioFile" accept=".wav,.mp3" />
+        <p class="hint">Supported upload formats: .wav and .mp3</p>
+      </div>
+
+      <div class="input-block">
+        <p><strong>Or record in the browser</strong></p>
+        <div class="button-row">
+          <button id="startRecordBtn" type="button">Start Recording</button>
+          <button id="stopRecordBtn" type="button" disabled>Stop Recording</button>
+        </div>
+        <p id="recordingStatus" class="status">Recorder idle.</p>
+      </div>
+
+      <div class="input-block">
+        <button id="submitBtn" type="button">Submit to /process</button>
+      </div>
+    </section>
+
+    <section class="card" id="resultsSection">
+      <h2>2. Results</h2>
+
+      <div class="result-block">
+        <h3>Transcript</h3>
+        <div id="transcriptText" class="output-box">No transcript yet.</div>
+      </div>
+
+      <div class="result-block">
+        <h3>Key Phrases</h3>
+        <div id="keyPhrases" class="tag-container"></div>
+      </div>
+
+      <div class="result-block">
+        <h3>Sentiment</h3>
+        <div id="sentimentBox" class="output-box">No sentiment result yet.</div>
+      </div>
+
+      <div class="result-block">
+        <h3>Named Entities</h3>
+        <div class="table-wrap">
+          <table id="entitiesTable">
+            <thead>
+              <tr>
+                <th>Text</th>
+                <th>Category</th>
+                <th>Subcategory</th>
+                <th>Confidence</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td colspan="4">No entities yet.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="result-block">
+        <h3>Linked Entities</h3>
+        <div id="linkedEntities" class="output-box">No linked entities yet.</div>
+      </div>
+
+      <div class="result-block">
+        <h3>Summary Text</h3>
+        <div id="summaryText" class="output-box">No summary yet.</div>
+      </div>
+
+      <div class="result-block">
+        <h3>Summary Audio</h3>
+        <audio id="summaryAudio" controls></audio>
+      </div>
+
+      <div class="result-block">
+        <h3>Status</h3>
+        <div id="requestStatus" class="output-box">Ready.</div>
+      </div>
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
