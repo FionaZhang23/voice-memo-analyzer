@@ -1,12 +1,26 @@
+import os
+
+# Load local .env for localhost development only.
+# On Azure App Service, App Settings provide these values.
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+# Telemetry must initialize BEFORE Flask and Azure SDK imports.
+from telemetry import init_telemetry
+init_telemetry()
+
 import base64
 import json
-import os
+import math
+import statistics
 import time
 import uuid
 from collections import Counter
 from pathlib import Path
 
-from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -15,45 +29,66 @@ import azure.cognitiveservices.speech as speechsdk
 from azure.ai.textanalytics import TextAnalyticsClient
 from azure.core.credentials import AzureKeyCredential
 
+from opentelemetry import metrics, trace
 
-# -----------------------------
-# Basic setup
-# -----------------------------
-load_dotenv()
 
 app = Flask(__name__)
 
+# -----------------------------
+# Basic app setup
+# -----------------------------
 BASE_DIR = Path(__file__).resolve().parent
 TEMP_AUDIO_DIR = BASE_DIR / "temp_audio"
 TEMP_AUDIO_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_SIZE_MB = 25
 MAX_CONTENT_LENGTH = MAX_FILE_SIZE_MB * 1024 * 1024
-ALLOWED_EXTENSIONS = {"wav", "mp3"}
+ALLOWED_EXTENSIONS = {"wav", "mp3", "webm", "ogg"}
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 
 SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-
 LANGUAGE_KEY = os.getenv("AZURE_LANGUAGE_KEY")
 LANGUAGE_ENDPOINT = os.getenv("AZURE_LANGUAGE_ENDPOINT")
 
 if not SPEECH_KEY or not SPEECH_REGION:
-    raise ValueError("Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION in .env")
+    raise ValueError("Missing AZURE_SPEECH_KEY or AZURE_SPEECH_REGION")
 
 if not LANGUAGE_KEY or not LANGUAGE_ENDPOINT:
-    raise ValueError("Missing AZURE_LANGUAGE_KEY or AZURE_LANGUAGE_ENDPOINT in .env")
+    raise ValueError("Missing AZURE_LANGUAGE_KEY or AZURE_LANGUAGE_ENDPOINT")
+
+# -----------------------------
+# OpenTelemetry setup
+# -----------------------------
+tracer = trace.get_tracer("memo-analyzer")
+meter = metrics.get_meter("memo-analyzer")
+
+# Using histograms for all per-call numeric metrics so the values show up
+# reliably as custom metrics in Azure Monitor.
+stt_confidence_metric = meter.create_histogram("stt_confidence")
+stt_duration_metric = meter.create_histogram("stt_duration_seconds")
+stt_word_count_metric = meter.create_histogram("stt_word_count")
+language_entity_count_metric = meter.create_histogram("language_entity_count")
+language_keyphrase_count_metric = meter.create_histogram("language_keyphrase_count")
+language_sentiment_metric = meter.create_histogram("language_sentiment")
+tts_char_count_metric = meter.create_histogram("tts_char_count")
+
+stage_stt_ms_metric = meter.create_histogram("stage_stt_ms")
+stage_language_ms_metric = meter.create_histogram("stage_language_ms")
+stage_tts_ms_metric = meter.create_histogram("stage_tts_ms")
+
+# -----------------------------
+# In-memory telemetry summary log
+# -----------------------------
+session_log = []
 
 
 # -----------------------------
-# Small helpers
+# Helper functions
 # -----------------------------
 def allowed_file(filename: str) -> bool:
-    if "." not in filename:
-        return False
-    ext = filename.rsplit(".", 1)[1].lower()
-    return ext in ALLOWED_EXTENSIONS
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
 def error_response(message: str, status_code: int):
@@ -84,7 +119,7 @@ def save_uploaded_audio(audio_file):
     return file_path
 
 
-def safe_delete_file(file_path: Path):
+def safe_delete_file(file_path):
     if file_path and file_path.exists():
         try:
             file_path.unlink()
@@ -92,21 +127,131 @@ def safe_delete_file(file_path: Path):
             pass
 
 
+def timed_stage(fn, *args, **kwargs):
+    """
+    Run fn(*args, **kwargs) and return (result, elapsed_ms).
+    """
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    return result, elapsed_ms
+
+
+def percentile_95(values):
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    idx = max(0, math.ceil(len(sorted_vals) * 0.95) - 1)
+    return sorted_vals[idx]
+
+
+# -----------------------------
+# Pipeline metrics / events
+# -----------------------------
+def emit_pipeline_metrics(stt_result, language_result, tts_result, stage_timings, audio_format):
+    attrs = {
+        "audio_format": audio_format,
+        "language": stt_result.get("language", "unknown"),
+    }
+
+    # STT metrics
+    stt_confidence_metric.record(float(stt_result.get("confidence", 0.0)), attrs)
+    stt_duration_metric.record(float(stt_result.get("duration_seconds", 0.0)), attrs)
+    stt_word_count_metric.record(int(len((stt_result.get("transcript", "") or "").split())), attrs)
+
+    # Language metrics
+    language_entity_count_metric.record(int(len(language_result.get("entities", []))), attrs)
+    language_keyphrase_count_metric.record(int(len(language_result.get("key_phrases", []))), attrs)
+
+    sentiment_map = {
+        "positive": 1.0,
+        "neutral": 0.0,
+        "negative": -1.0,
+    }
+    language_sentiment_metric.record(
+        float(sentiment_map.get(language_result.get("sentiment", {}).get("label", "neutral"), 0.0)),
+        attrs,
+    )
+
+    # TTS metrics
+    tts_char_count_metric.record(int(tts_result.get("char_count", 0)), attrs)
+
+    # Stage latency metrics
+    stage_stt_ms_metric.record(float(stage_timings["stt_ms"]), attrs)
+    stage_language_ms_metric.record(float(stage_timings["language_ms"]), attrs)
+    stage_tts_ms_metric.record(float(stage_timings["tts_ms"]), attrs)
+
+
+def emit_pipeline_event(stt_result=None, lang_result=None, audio_format=None,
+                        success=True, error_stage=None, error_msg=None):
+    span = trace.get_current_span()
+
+    if success:
+        span.set_attribute("event.name", "pipeline_completed")
+        if stt_result:
+            span.set_attribute("stt.confidence", float(stt_result.get("confidence", 0.0)))
+            span.set_attribute("stt.language", stt_result.get("language", "unknown"))
+        if lang_result:
+            span.set_attribute("entities.count", int(len(lang_result.get("entities", []))))
+            span.set_attribute("sentiment", lang_result.get("sentiment", {}).get("label", "unknown"))
+        if audio_format:
+            span.set_attribute("audio.format", audio_format)
+
+        span.add_event(
+            "pipeline_completed",
+            {
+                "audio.format": audio_format or "unknown",
+                "stt.language": stt_result.get("language", "unknown") if stt_result else "unknown",
+                "stt.confidence": float(stt_result.get("confidence", 0.0)) if stt_result else 0.0,
+                "entities.count": int(len(lang_result.get("entities", []))) if lang_result else 0,
+                "sentiment": lang_result.get("sentiment", {}).get("label", "unknown") if lang_result else "unknown",
+            },
+        )
+    else:
+        span.set_attribute("event.name", "pipeline_error")
+        span.set_attribute("error.stage", error_stage or "unknown")
+        span.set_attribute("error.message", error_msg or "unknown")
+        if audio_format:
+            span.set_attribute("audio.format", audio_format)
+
+        span.add_event(
+            "pipeline_error",
+            {
+                "audio.format": audio_format or "unknown",
+                "error.stage": error_stage or "unknown",
+                "error.message": error_msg or "unknown",
+            },
+        )
+
+        if error_msg:
+            span.record_exception(Exception(error_msg))
+
+
+def log_pipeline_call(stt_result, lang_result, timings, audio_format):
+    session_log.append(
+        {
+            "confidence": float(stt_result.get("confidence", 0.0)),
+            "language": stt_result.get("language", "unknown"),
+            "entity_count": len(lang_result.get("entities", [])),
+            "keyphrase_count": len(lang_result.get("key_phrases", [])),
+            "sentiment": lang_result.get("sentiment", {}).get("label", "unknown"),
+            "stt_ms": float(timings["stt_ms"]),
+            "language_ms": float(timings["language_ms"]),
+            "tts_ms": float(timings["tts_ms"]),
+            "audio_format": audio_format,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    )
+
+
 # -----------------------------
 # Speech-to-Text
 # -----------------------------
 def transcribe_file_with_azure(file_path: str) -> dict:
-    """
-    Transcribe one audio file with Azure Speech SDK.
-    Returns a dict matching the Part B response structure as closely as possible.
-    """
-
     speech_config = speechsdk.SpeechConfig(
         subscription=SPEECH_KEY,
         region=SPEECH_REGION,
     )
-
-    # Ask for detailed output so we can parse confidence and word timings
     speech_config.output_format = speechsdk.OutputFormat.Detailed
 
     audio_config = speechsdk.audio.AudioConfig(filename=file_path)
@@ -144,7 +289,6 @@ def transcribe_file_with_azure(file_path: str) -> dict:
         if result.json:
             try:
                 detailed = json.loads(result.json)
-
                 nbest = detailed.get("NBest", [])
                 if nbest:
                     top = nbest[0]
@@ -170,9 +314,7 @@ def transcribe_file_with_azure(file_path: str) -> dict:
                 primary_language = detailed.get("PrimaryLanguage")
                 if isinstance(primary_language, dict):
                     language = primary_language.get("Language", language)
-
             except Exception:
-                # Keep fallback if Azure's detailed JSON shape varies
                 pass
 
         return {
@@ -195,8 +337,8 @@ def transcribe_file_with_azure(file_path: str) -> dict:
     if result.reason == speechsdk.ResultReason.Canceled:
         cancellation = result.cancellation_details
         error_text = cancellation.error_details or "Speech recognition canceled."
-
         lowered = error_text.lower()
+
         if (
             "invalid header" in lowered
             or "unsupported" in lowered
@@ -214,7 +356,7 @@ def transcribe_file_with_azure(file_path: str) -> dict:
 
 
 # -----------------------------
-# Azure Language
+# Language Analysis
 # -----------------------------
 def analyze_text_with_azure(text: str) -> dict:
     client = get_language_client()
@@ -233,9 +375,7 @@ def analyze_text_with_azure(text: str) -> dict:
 
     linked_entities_result = client.recognize_linked_entities([text])[0]
     if linked_entities_result.is_error:
-        raise RuntimeError(
-            f"Linked entity recognition failed: {linked_entities_result.error}"
-        )
+        raise RuntimeError(f"Linked entity recognition failed: {linked_entities_result.error}")
 
     entities = []
     for entity in entities_result.entities:
@@ -281,7 +421,7 @@ def analyze_text_with_azure(text: str) -> dict:
 
 
 # -----------------------------
-# Summary builder + TTS
+# Summary + TTS
 # -----------------------------
 def build_summary_text(analysis_result: dict) -> str:
     key_phrases = analysis_result.get("key_phrases", [])
@@ -308,7 +448,6 @@ def build_summary_text(analysis_result: dict) -> str:
         entity_sentence = "I did not detect any named entities."
 
     sentiment_sentence = f"The overall tone is {sentiment}."
-
     return f"{phrase_sentence} {sentiment_sentence} {entity_sentence}"
 
 
@@ -318,10 +457,7 @@ def synthesize_summary_to_base64(summary_text: str, voice_name: str = "en-US-Jen
         region=SPEECH_REGION,
     )
 
-    # Neural voice
     speech_config.speech_synthesis_voice_name = voice_name
-
-    # MP3 output
     speech_config.set_speech_synthesis_output_format(
         speechsdk.SpeechSynthesisOutputFormat.Audio16Khz32KBitRateMonoMp3
     )
@@ -415,6 +551,9 @@ def process():
         return error_response("Missing file field 'audio'.", 400)
 
     audio_file = request.files["audio"]
+    audio_format = ""
+    if audio_file and audio_file.filename:
+        audio_format = audio_file.filename.rsplit(".", 1)[-1].lower()
 
     if not audio_file or audio_file.filename.strip() == "":
         return error_response("No file selected.", 400)
@@ -426,40 +565,118 @@ def process():
         )
 
     file_path = None
-    try:
-        file_path = save_uploaded_audio(audio_file)
+    current_stage = "upload"
 
-        stt_result = transcribe_file_with_azure(str(file_path))
-        transcript = stt_result.get("transcript", "").strip()
+    with tracer.start_as_current_span("pipeline.process") as root_span:
+        root_span.set_attribute("audio.format", audio_format)
 
-        if not transcript:
-            return error_response(
-                "Transcription completed but returned empty text.",
-                400,
-            )
+        try:
+            file_path = save_uploaded_audio(audio_file)
 
-        analysis_result = analyze_text_with_azure(transcript)
-        summary_text = build_summary_text(analysis_result)
-        tts_result = synthesize_summary_to_base64(summary_text)
+            # Stage 1 — STT
+            current_stage = "speech_to_text"
+            with tracer.start_as_current_span("stage.speech_to_text") as stt_span:
+                stt_result, stt_ms = timed_stage(transcribe_file_with_azure, str(file_path))
+                stt_span.set_attribute("stt.confidence", float(stt_result.get("confidence", 0.0)))
+                stt_span.set_attribute("stt.word_count", len((stt_result.get("transcript", "") or "").split()))
+                stt_span.set_attribute("duration_ms", float(stt_ms))
 
-        return jsonify(
-            {
-                **stt_result,
-                "analysis": analysis_result,
-                "summary": tts_result,
+            transcript = stt_result.get("transcript", "").strip()
+            if not transcript:
+                emit_pipeline_event(
+                    success=False,
+                    error_stage=current_stage,
+                    error_msg="Transcription completed but returned empty text.",
+                    audio_format=audio_format,
+                )
+                return error_response("Transcription completed but returned empty text.", 400)
+
+            # Stage 2 — Language
+            current_stage = "language_analysis"
+            with tracer.start_as_current_span("stage.language_analysis") as lang_span:
+                lang_result, lang_ms = timed_stage(analyze_text_with_azure, transcript)
+                lang_span.set_attribute("entity_count", len(lang_result.get("entities", [])))
+                lang_span.set_attribute("sentiment", lang_result.get("sentiment", {}).get("label", "unknown"))
+                lang_span.set_attribute("duration_ms", float(lang_ms))
+
+            # Stage 3 — TTS
+            current_stage = "text_to_speech"
+            summary_text = build_summary_text(lang_result)
+            with tracer.start_as_current_span("stage.text_to_speech") as tts_span:
+                tts_result, tts_ms = timed_stage(synthesize_summary_to_base64, summary_text)
+                tts_span.set_attribute("char_count", len(summary_text))
+                tts_span.set_attribute("duration_ms", float(tts_ms))
+
+            stage_timings = {
+                "stt_ms": stt_ms,
+                "language_ms": lang_ms,
+                "tts_ms": tts_ms,
             }
-        ), 200
 
-    except ValueError as e:
-        return error_response(str(e), 415)
+            emit_pipeline_metrics(stt_result, lang_result, tts_result, stage_timings, audio_format)
+            emit_pipeline_event(stt_result, lang_result, audio_format, success=True)
+            log_pipeline_call(stt_result, lang_result, stage_timings, audio_format)
 
-    except Exception as e:
-        return error_response(f"Pipeline failed: {str(e)}", 500)
+            return jsonify(
+                {
+                    **stt_result,
+                    "analysis": lang_result,
+                    "summary": tts_result,
+                }
+            ), 200
 
-    finally:
-        safe_delete_file(file_path)
+        except ValueError as e:
+            emit_pipeline_event(
+                success=False,
+                error_stage=current_stage,
+                error_msg=str(e),
+                audio_format=audio_format,
+            )
+            return error_response(str(e), 415)
+
+        except Exception as e:
+            emit_pipeline_event(
+                success=False,
+                error_stage=current_stage,
+                error_msg=str(e),
+                audio_format=audio_format,
+            )
+            return error_response(f"Pipeline failed: {str(e)}", 500)
+
+        finally:
+            safe_delete_file(file_path)
+
+
+@app.route("/telemetry-summary", methods=["GET"])
+def telemetry_summary():
+    if not session_log:
+        return jsonify({"message": "No calls yet"})
+
+    confidences = [entry["confidence"] for entry in session_log]
+    stt_values = [entry["stt_ms"] for entry in session_log]
+    lang_values = [entry["language_ms"] for entry in session_log]
+    tts_values = [entry["tts_ms"] for entry in session_log]
+
+    return jsonify(
+        {
+            "total_calls": len(session_log),
+            "avg_confidence": round(statistics.mean(confidences), 3),
+            "min_confidence": round(min(confidences), 3),
+            "max_confidence": round(max(confidences), 3),
+            "p95_stt_ms": round(percentile_95(stt_values), 2),
+            "avg_stt_ms": round(statistics.mean(stt_values), 2),
+            "avg_language_ms": round(statistics.mean(lang_values), 2),
+            "avg_tts_ms": round(statistics.mean(tts_values), 2),
+            "sentiment_breakdown": {
+                "positive": sum(1 for entry in session_log if entry["sentiment"] == "positive"),
+                "neutral": sum(1 for entry in session_log if entry["sentiment"] == "neutral"),
+                "negative": sum(1 for entry in session_log if entry["sentiment"] == "negative"),
+            },
+            "calls": session_log[-10:],
+        }
+    )
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
